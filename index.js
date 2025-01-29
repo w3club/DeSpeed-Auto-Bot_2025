@@ -23,24 +23,128 @@ const config = {
     url: "",
     timeout: 10000,
     maxRetries: 3,
-    testUrl: "https://api.ipify.org?format=json",
-    currentIndex: 0
+    testUrl: "https://api.ipify.org?format=json"
   }
 };
 
+// Modern console output helper
 const logger = {
-  info: (msg) => console.log(kleur.blue('â„¹'), kleur.white(msg)),
-  success: (msg) => console.log(kleur.green('âœ”'), kleur.white(msg)),
-  warning: (msg) => console.log(kleur.yellow('âš '), kleur.white(msg)),
-  error: (msg) => console.log(kleur.red('âœ–'), kleur.white(msg)),
-  speed: (msg) => console.log(kleur.cyan('â†¯'), kleur.white(msg)),
-  time: (msg) => console.log(kleur.magenta('â°'), kleur.white(msg)),
-  location: (msg) => console.log(kleur.yellow('ðŸ“'), kleur.white(msg)),
-  network: (msg) => console.log(kleur.blue('ðŸŒ'), kleur.white(msg))
+  info: (msg) => console.log(kleur.blue('ℹ'), kleur.white(msg)),
+  success: (msg) => console.log(kleur.green('✔'), kleur.white(msg)),
+  warning: (msg) => console.log(kleur.yellow('⚠'), kleur.white(msg)),
+  error: (msg) => console.log(kleur.red('✖'), kleur.white(msg)),
+  speed: (msg) => console.log(kleur.cyan('↯'), kleur.white(msg)),
+  time: (msg) => console.log(kleur.magenta('⏰'), kleur.white(msg)),
+  location: (msg) => console.log(kleur.yellow('📍'), kleur.white(msg)),
+  network: (msg) => console.log(kleur.blue('🌐'), kleur.white(msg))
 };
 
-let proxyList = [];
+// Read proxy from file
+async function loadProxyFromFile() {
+  try {
+    const proxyContent = await fs.readFile('proxy.txt', 'utf8');
+    const proxyUrl = proxyContent.trim();
+    
+    if (!proxyUrl) {
+      return null;
+    }
 
+    if (proxyUrl.startsWith('http://') || proxyUrl.startsWith('https://')) {
+      config.proxy.type = 'http';
+      config.proxy.url = proxyUrl;
+    } else if (proxyUrl.startsWith('socks4://')) {
+      config.proxy.type = 'socks4';
+      config.proxy.url = proxyUrl;
+    } else if (proxyUrl.startsWith('socks5://')) {
+      config.proxy.type = 'socks5';
+      config.proxy.url = proxyUrl;
+    } else {
+      config.proxy.type = 'http';
+      config.proxy.url = `http://${proxyUrl}`;
+    }
+
+    return true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      logger.error(`Error reading proxy file: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+// Create proxy agent based on type
+async function createProxyAgent() {
+  if (!config.proxy.url) {
+    return undefined;
+  }
+
+  try {
+    if (config.proxy.type === 'http') {
+      return new HttpsProxyAgent({
+        proxy: config.proxy.url,
+        timeout: config.proxy.timeout,
+        keepAlive: true,
+        maxFreeSockets: 256,
+        maxSockets: 256
+      });
+    } else {
+      return new SocksProxyAgent({
+        proxy: config.proxy.url,
+        timeout: config.proxy.timeout,
+        keepAlive: true,
+        type: config.proxy.type === 'socks4' ? 4 : 5
+      });
+    }
+  } catch (error) {
+    logger.error(`Failed to create proxy agent: ${error.message}`);
+    return undefined;
+  }
+}
+
+// Check proxy availability
+async function isProxyAlive(proxyAgent) {
+  try {
+    const response = await fetch(config.proxy.testUrl, {
+      agent: proxyAgent,
+      timeout: config.proxy.timeout
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Get working proxy agent with retries
+async function getProxyAgent(retries = config.proxy.maxRetries) {
+  if (!config.proxy.enabled) return undefined;
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const agent = await createProxyAgent();
+      if (!agent) {
+        return undefined;
+      }
+
+      if (await isProxyAlive(agent)) {
+        logger.success(`Proxy connection established (${config.proxy.type})`);
+        return agent;
+      }
+
+      logger.warning(`Proxy check failed, attempt ${i + 1}/${retries}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+
+    } catch (error) {
+      logger.error(`Proxy error (${i + 1}/${retries}): ${error.message}`);
+      if (i === retries - 1) {
+        throw new Error('Maximum proxy retry attempts reached');
+      }
+    }
+  }
+
+  return undefined;
+}
+
+// Generate random location
 function generateRandomLocation() {
   const bounds = {
     minLat: 18.0,
@@ -58,133 +162,7 @@ function generateRandomLocation() {
   };
 }
 
-async function loadProxiesFromFile() {
-  try {
-    const content = await fs.readFile('proxy.txt', 'utf8');
-    const lines = content.split('\n').filter(line => 
-      line.trim() && !line.startsWith('#')
-    );
-
-    proxyList = lines.map(line => {
-      let type = 'http';
-      let url = line.trim();
-
-      if (url.startsWith('socks4://')) {
-        type = 'socks4';
-      } else if (url.startsWith('socks5://')) {
-        type = 'socks5';
-      } else if (!url.includes('://')) {
-        url = `http://${url}`;
-      }
-
-      return { type, url };
-    });
-
-    if (proxyList.length > 0) {
-      config.proxy.enabled = true;
-      logger.success(`Loaded ${proxyList.length} proxies from proxy.txt`);
-      return true;
-    }
-
-    return false;
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      logger.error(`Error reading proxy file: ${error.message}`);
-    }
-    return false;
-  }
-}
-
-function getNextProxy() {
-  if (proxyList.length === 0) return null;
-  
-  const proxy = proxyList[config.proxy.currentIndex];
-  config.proxy.currentIndex = (config.proxy.currentIndex + 1) % proxyList.length;
-  
-  return proxy;
-}
-
-async function createProxyAgent() {
-  const proxy = getNextProxy();
-  if (!proxy) return undefined;
-
-  config.proxy.type = proxy.type;
-  config.proxy.url = proxy.url;
-
-  try {
-    if (proxy.type === 'http') {
-      return new HttpsProxyAgent({
-        proxy: proxy.url,
-        timeout: config.proxy.timeout,
-        keepAlive: true,
-        maxFreeSockets: 256,
-        maxSockets: 256
-      });
-    } else {
-      return new SocksProxyAgent({
-        proxy: proxy.url,
-        timeout: config.proxy.timeout,
-        keepAlive: true,
-        type: proxy.type === 'socks4' ? 4 : 5
-      });
-    }
-  } catch (error) {
-    logger.error(`Failed to create proxy agent: ${error.message}`);
-    return undefined;
-  }
-}
-
-async function isProxyAlive(proxyAgent) {
-  try {
-    const response = await fetch(config.proxy.testUrl, {
-      agent: proxyAgent,
-      timeout: config.proxy.timeout
-    });
-    
-    if (response.ok) {
-      const data = await response.json();
-      logger.success(`Proxy IP: ${data.ip}`);
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-async function getProxyAgent(retries = config.proxy.maxRetries) {
-  if (!config.proxy.enabled || proxyList.length === 0) return undefined;
-
-  const initialIndex = config.proxy.currentIndex;
-  let attempts = 0;
-
-  while (attempts < retries * proxyList.length) {
-    try {
-      const agent = await createProxyAgent();
-      if (!agent) {
-        return undefined;
-      }
-
-      if (await isProxyAlive(agent)) {
-        logger.success(`Proxy connection established (${config.proxy.type})`);
-        return agent;
-      }
-
-      logger.warning(`Proxy check failed, trying next proxy...`);
-      if (config.proxy.currentIndex === initialIndex) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * (Math.floor(attempts / proxyList.length) + 1)));
-      }
-
-    } catch (error) {
-      logger.error(`Proxy error: ${error.message}`);
-    }
-    
-    attempts++;
-  }
-
-  throw new Error('All proxies failed after maximum retry attempts');
-}
-
+// Initialize configuration
 async function initConfig() {
   logger.info('Starting configuration setup...');
 
@@ -197,17 +175,24 @@ async function initConfig() {
 
   config.token = await question(kleur.cyan('Enter your DeSpeed token: '));
 
-  const proxyFileExists = await loadProxiesFromFile();
-  if (!proxyFileExists) {
-    const useProxy = (await question(kleur.cyan('No proxy.txt found or empty. Use manual proxy? (y/n): '))).toLowerCase() === 'y';
+  const proxyFileExists = await loadProxyFromFile();
+  if (proxyFileExists) {
+    logger.success('Loaded proxy configuration from proxy.txt');
+    config.proxy.enabled = true;
+  } else {
+    const useProxy = (await question(kleur.cyan('Use proxy? (y/n): '))).toLowerCase() === 'y';
     if (useProxy) {
       config.proxy.enabled = true;
       const proxyUrl = await question(kleur.cyan('Enter proxy URL (e.g., http://user:pass@ip:port or socks5://ip:port): '));
-      proxyList.push({
-        type: proxyUrl.startsWith('socks4://') ? 'socks4' : 
-              proxyUrl.startsWith('socks5://') ? 'socks5' : 'http',
-        url: proxyUrl
-      });
+      config.proxy.url = proxyUrl;
+      
+      if (proxyUrl.startsWith('socks4://')) {
+        config.proxy.type = 'socks4';
+      } else if (proxyUrl.startsWith('socks5://')) {
+        config.proxy.type = 'socks5';
+      } else {
+        config.proxy.type = 'http';
+      }
     }
   }
 
@@ -221,13 +206,27 @@ async function initConfig() {
 
   logger.success('Configuration completed!');
   logger.info('Current settings:');
-  const displayConfig = { ...config };
-  if (proxyList.length > 0) {
-    displayConfig.proxy.proxies = `${proxyList.length} proxies loaded`;
-  }
-  console.log(kleur.gray(JSON.stringify(displayConfig, null, 2)));
+  console.log(kleur.gray(JSON.stringify(config, null, 2)));
 }
 
+// Get common headers
+function getCommonHeaders() {
+  return {
+    'Authorization': `Bearer ${config.token}`,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'sec-ch-ua': '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Origin': 'https://app.despeed.net',
+    'Referer': 'https://app.despeed.net/dashboard'
+  };
+}
+
+// Validate token
 async function validateToken() {
   if (!config.token) {
     throw new Error('Token not found');
@@ -255,22 +254,7 @@ async function validateToken() {
   }
 }
 
-function getCommonHeaders() {
-  return {
-    'Authorization': `Bearer ${config.token}`,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'sec-ch-ua': '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'Origin': 'https://app.despeed.net',
-    'Referer': 'https://app.despeed.net/dashboard'
-  };
-}
-
+// Perform speed test
 async function performSpeedTest() {
   try {
     logger.network('Starting network speed measurement...');
@@ -464,6 +448,7 @@ async function reportResults(downloadSpeed, uploadSpeed) {
   }
 }
 
+// Display account information
 async function displayAccountInfo() {
   try {
     logger.info('\n=== Account Information ===');
@@ -487,6 +472,7 @@ async function displayAccountInfo() {
   }
 }
 
+// Main loop
 async function main() {
   try {
     logger.info('\n=== Starting speed test ===');
