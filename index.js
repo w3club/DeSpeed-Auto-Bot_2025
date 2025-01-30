@@ -1,5 +1,5 @@
 const fetch = require("node-fetch");
-const HttpsProxyAgent = require("https-proxy-agent");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const readline = require("readline");
 const WebSocket = require('ws');
