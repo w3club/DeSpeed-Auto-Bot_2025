@@ -314,6 +314,7 @@ async function performSpeedTest() {
     const downloadUrl = server.urls['wss:///ndt/v7/download'];
     const uploadUrl = server.urls['wss:///ndt/v7/upload'];
 
+    // Download test
     logger.network('Starting download test...');
     let downloadSpeed = 0;
     await new Promise((resolve) => {
@@ -356,6 +357,7 @@ async function performSpeedTest() {
       });
     });
 
+    // Upload test with fixes
     logger.network('Starting upload test...');
     let uploadSpeed = 0;
     await new Promise((resolve) => {
@@ -364,35 +366,39 @@ async function performSpeedTest() {
       } : undefined;
       
       const ws = new WebSocket(uploadUrl, 'net.measurementlab.ndt.v7', wsOptions);
-      let startTime = Date.now();
+      let startTime = null;
       let totalBytes = 0;
       let lastMeasurement = null;
-      let uploadData = Buffer.alloc(32768);
+      let uploadInterval = null;
+      
+      // Create smaller chunks for upload
+      const chunkSize = 16384; // 16KB chunks
+      const uploadData = Buffer.alloc(chunkSize);
       crypto.randomFillSync(uploadData);
 
       ws.on('open', () => {
         startTime = Date.now();
         totalBytes = 0;
-        const sendData = () => {
+
+        uploadInterval = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             const now = Date.now();
             const duration = (now - startTime) / 1000;
             
             if (duration >= 10) {
               uploadSpeed = (totalBytes * 8) / (duration * 1000000);
+              clearInterval(uploadInterval);
               ws.close();
               return;
             }
 
-            while (ws.bufferedAmount < 1024 * 1024) {
+            // Send data only if WebSocket buffer is not too full
+            if (ws.bufferedAmount < 1024 * 1024) {
               ws.send(uploadData);
               totalBytes += uploadData.length;
             }
-
-            setImmediate(sendData);
           }
-        };
-        sendData();
+        }, 1); // Send data every millisecond
       });
 
       ws.on('message', (data) => {
@@ -401,9 +407,12 @@ async function performSpeedTest() {
             lastMeasurement = JSON.parse(data);
             if (lastMeasurement.TCPInfo) {
               const tcpInfo = lastMeasurement.TCPInfo;
-              const tmpSpeed = (tcpInfo.BytesReceived / tcpInfo.ElapsedTime) * 8;
-              if (tmpSpeed > uploadSpeed) {
-                uploadSpeed = tmpSpeed;
+              const elapsed = tcpInfo.ElapsedTime || 1;  // Prevent division by zero
+              if (elapsed > 0) {
+                const tmpSpeed = (tcpInfo.BytesReceived / elapsed) * 8;
+                if (tmpSpeed > uploadSpeed) {
+                  uploadSpeed = tmpSpeed;
+                }
               }
             }
           } catch (e) {
@@ -413,14 +422,37 @@ async function performSpeedTest() {
       });
 
       ws.on('close', () => {
+        if (uploadInterval) {
+          clearInterval(uploadInterval);
+        }
+        
+        // Calculate final speed if not already set
+        if (uploadSpeed === 0 && startTime && totalBytes > 0) {
+          const duration = (Date.now() - startTime) / 1000;
+          uploadSpeed = (totalBytes * 8) / (duration * 1000000);
+        }
+        
         logger.speed(`Upload: ${uploadSpeed.toFixed(2)} Mbps`);
         resolve();
       });
 
       ws.on('error', (error) => {
+        if (uploadInterval) {
+          clearInterval(uploadInterval);
+        }
         logger.error(`Upload test error: ${error.message}`);
         resolve();
       });
+
+      // Set a timeout to ensure the test doesn't run forever
+      setTimeout(() => {
+        if (uploadInterval) {
+          clearInterval(uploadInterval);
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      }, 15000); // 15 second timeout
     });
 
     return { downloadSpeed, uploadSpeed };
