@@ -10,13 +10,9 @@ const banner = require('./banner');
 
 // Configuration
 const config = {
-  token: "",
+  tokens: [],
   baseUrl: "https://app.despeed.net",
   checkInterval: 60000,
-  location: {
-    latitude: 39.904202,
-    longitude: 116.407394
-  },
   proxy: {
     enabled: false,
     type: "http",
@@ -38,6 +34,31 @@ const logger = {
   location: (msg) => console.log(kleur.yellow('📍'), kleur.white(msg)),
   network: (msg) => console.log(kleur.blue('🌐'), kleur.white(msg))
 };
+
+// Read tokens from file
+async function loadTokensFromFile() {
+  try {
+    const content = await fs.readFile('token.txt', 'utf8');
+    const tokens = content.split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+    
+    if (tokens.length === 0) {
+      throw new Error('No valid tokens found in token.txt');
+    }
+    
+    config.tokens = tokens;
+    logger.success(`Loaded ${tokens.length} tokens from token.txt`);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      logger.error('token.txt file not found');
+    } else {
+      logger.error(`Error reading token file: ${error.message}`);
+    }
+    return false;
+  }
+}
 
 // Read proxy from file
 async function loadProxyFromFile() {
@@ -166,20 +187,23 @@ function generateRandomLocation() {
 async function initConfig() {
   logger.info('Starting configuration setup...');
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-
-  const question = (query) => new Promise((resolve) => rl.question(query, resolve));
-
-  config.token = await question(kleur.cyan('Enter your DeSpeed token: '));
+  const tokensLoaded = await loadTokensFromFile();
+  if (!tokensLoaded) {
+    throw new Error('Failed to load tokens from token.txt');
+  }
 
   const proxyFileExists = await loadProxyFromFile();
   if (proxyFileExists) {
     logger.success('Loaded proxy configuration from proxy.txt');
     config.proxy.enabled = true;
   } else {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    const question = (query) => new Promise((resolve) => rl.question(query, resolve));
+
     const useProxy = (await question(kleur.cyan('Use proxy? (y/n): '))).toLowerCase() === 'y';
     if (useProxy) {
       config.proxy.enabled = true;
@@ -194,25 +218,23 @@ async function initConfig() {
         config.proxy.type = 'http';
       }
     }
+
+    const interval = await question(kleur.cyan('Enter check interval (minutes, default 1): '));
+    config.checkInterval = (parseInt(interval) || 1) * 60000;
+
+    rl.close();
   }
-
-  const interval = await question(kleur.cyan('Enter check interval (minutes, default 1): '));
-  config.checkInterval = (parseInt(interval) || 1) * 60000;
-
-  rl.close();
-
-  config.location = generateRandomLocation();
-  logger.location(`Test location: ${config.location.latitude}, ${config.location.longitude}`);
 
   logger.success('Configuration completed!');
   logger.info('Current settings:');
-  console.log(kleur.gray(JSON.stringify(config, null, 2)));
+  const safeConfig = {...config, tokens: `${config.tokens.length} tokens loaded`};
+  console.log(kleur.gray(JSON.stringify(safeConfig, null, 2)));
 }
 
 // Get common headers
-function getCommonHeaders() {
+function getCommonHeaders(token) {
   return {
-    'Authorization': `Bearer ${config.token}`,
+    'Authorization': `Bearer ${token}`,
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -227,20 +249,20 @@ function getCommonHeaders() {
 }
 
 // Validate token
-async function validateToken() {
-  if (!config.token) {
+async function validateToken(token) {
+  if (!token) {
     throw new Error('Token not found');
   }
   
   try {
-    const tokenData = JSON.parse(atob(config.token.split('.')[1]));
+    const tokenData = JSON.parse(atob(token.split('.')[1]));
     if ((tokenData.exp - 90) * 1000 < Date.now()) {
       throw new Error('Token expired');
     }
 
     const proxyAgent = await getProxyAgent();
     const profileResponse = await fetch(`${config.baseUrl}/v1/api/auth/profile`, {
-      headers: getCommonHeaders(),
+      headers: getCommonHeaders(token),
       agent: proxyAgent,
       timeout: 30000
     });
@@ -248,9 +270,11 @@ async function validateToken() {
     if (!profileResponse.ok) {
       throw new Error('Token invalid');
     }
+
+    return true;
   } catch (error) {
     logger.error(`Token validation failed: ${error.message}`);
-    throw error;
+    return false;
   }
 }
 
@@ -407,7 +431,7 @@ async function performSpeedTest() {
   }
 }
 
-async function reportResults(downloadSpeed, uploadSpeed) {
+async function reportResults(token, downloadSpeed, uploadSpeed, location) {
   try {
     logger.info('Submitting test results...');
 
@@ -415,7 +439,7 @@ async function reportResults(downloadSpeed, uploadSpeed) {
     const response = await fetch(`${config.baseUrl}/v1/api/points`, {
       method: 'POST',
       headers: {
-        ...getCommonHeaders(),
+        ...getCommonHeaders(token),
         'Content-Type': 'application/json'
       },
       agent: proxyAgent,
@@ -423,8 +447,8 @@ async function reportResults(downloadSpeed, uploadSpeed) {
       body: JSON.stringify({
         download_speed: Math.round(downloadSpeed * 100) / 100,
         upload_speed: Math.round(uploadSpeed * 100) / 100,
-        latitude: config.location.latitude,
-        longitude: config.location.longitude,
+        latitude: location.latitude,
+        longitude: location.longitude,
         timestamp: new Date().toISOString()
       })
     });
@@ -449,13 +473,13 @@ async function reportResults(downloadSpeed, uploadSpeed) {
 }
 
 // Display account information
-async function displayAccountInfo() {
+async function displayAccountInfo(token) {
   try {
     logger.info('\n=== Account Information ===');
     
     const proxyAgent = await getProxyAgent();
     const profileResponse = await fetch(`${config.baseUrl}/v1/api/auth/profile`, {
-      headers: getCommonHeaders(),
+      headers: getCommonHeaders(token),
       agent: proxyAgent,
       timeout: 30000
     });
@@ -472,39 +496,44 @@ async function displayAccountInfo() {
   }
 }
 
-// Main loop
-async function main() {
+// Process single account
+async function processAccount(token, accountIndex) {
   try {
-    logger.info('\n=== Starting speed test ===');
+    logger.info(`\n=== Processing Account ${accountIndex + 1} ===`);
     logger.time(`Time: ${new Date().toLocaleString()}`);
     
-    await validateToken();
-    logger.success('Token validation successful');
+    const isValid = await validateToken(token);
+    if (!isValid) {
+      logger.error(`Token ${accountIndex + 1} is invalid or expired`);
+      return false;
+    }
+    logger.success(`Token ${accountIndex + 1} validation successful`);
     
-    await displayAccountInfo();
+    await displayAccountInfo(token);
     
-    config.location = generateRandomLocation();
-    logger.location(`Speed test location: ${config.location.latitude}, ${config.location.longitude}`);
+    const location = generateRandomLocation();
+    logger.location(`Speed test location: ${location.latitude}, ${location.longitude}`);
     
     logger.network('Starting speed test...');
     const { downloadSpeed, uploadSpeed } = await performSpeedTest();
     logger.speed(`Final Download speed: ${downloadSpeed.toFixed(2)} Mbps`);
     logger.speed(`Final Upload speed: ${uploadSpeed.toFixed(2)} Mbps`);
     
-    const result = await reportResults(downloadSpeed, uploadSpeed);
+    const result = await reportResults(token, downloadSpeed, uploadSpeed, location);
     
     if (result && result.success) {
       logger.success('Speed test completed and results reported');
-      await displayAccountInfo();
+      return true;
     } else {
       logger.error('Failed to report results');
       if (result && result.message) {
         logger.error(`Failure reason: ${result.message}`);
       }
+      return false;
     }
     
   } catch (error) {
-    logger.error(`Error during speed test: ${error.message}`);
+    logger.error(`Error processing account ${accountIndex + 1}: ${error.message}`);
     if (error.response) {
       try {
         const errorData = await error.response.json();
@@ -513,9 +542,30 @@ async function main() {
         logger.error(`Status code: ${error.response.status}`);
       }
     }
+    return false;
+  }
+}
+
+// Main loop
+async function main() {
+  try {
+    logger.info('\n=== Starting multi-account speed test ===');
+    
+    for (let i = 0; i < config.tokens.length; i++) {
+      await processAccount(config.tokens[i], i);
+      
+      // Add delay between accounts
+      if (i < config.tokens.length - 1) {
+        logger.info('Waiting 30 seconds before processing next account...');
+        await new Promise(resolve => setTimeout(resolve, 30000));
+      }
+    }
+    
+  } catch (error) {
+    logger.error(`Error during main loop: ${error.message}`);
   } finally {
     const nextTime = new Date(Date.now() + config.checkInterval);
-    logger.time(`Next test scheduled for: ${nextTime.toLocaleString()}`);
+    logger.time(`Next test cycle scheduled for: ${nextTime.toLocaleString()}`);
     logger.info(`Interval: ${Math.round(config.checkInterval / 1000 / 60)} minutes`);
     logger.info('=== Speed test cycle complete ===\n');
     setTimeout(main, config.checkInterval);
@@ -536,7 +586,7 @@ process.on('SIGTERM', () => {
 // Start the program
 console.clear();
 console.log(kleur.cyan(banner));
-logger.info('Initializing DeSpeed Test Client...');
+logger.info('Initializing Multi-Account DeSpeed Test Client...');
 initConfig().then(() => {
   main();
 }).catch(error => {
