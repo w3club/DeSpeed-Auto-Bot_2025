@@ -39,6 +39,12 @@ http://user:pass@ip:port
 socks5://ip:port
 ```
 
+4. Input your token
+Fill with your tokens
+```bash
+nano token.txt
+```
+
 ## ⚙️ Configuration
 
 When you run the bot for the first time, it will prompt you for:
