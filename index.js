@@ -109,12 +109,7 @@ async function createProxyAgent() {
         maxSockets: 256
       });
     } else {
-      return new SocksProxyAgent({
-        proxy: config.proxy.url,
-        timeout: config.proxy.timeout,
-        keepAlive: true,
-        type: config.proxy.type === 'socks4' ? 4 : 5
-      });
+      return new SocksProxyAgent(config.proxy.url);
     }
   } catch (error) {
     logger.error(`Failed to create proxy agent: ${error.message}`);
